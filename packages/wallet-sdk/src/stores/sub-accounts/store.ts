@@ -16,13 +16,12 @@ export type SubAccountInfo = {
 export type SubAccountState = {
   getSigner: null | GetSubAccountSigner;
   account?: SubAccountInfo;
-  universalAccount: Address | null;
+  universalAccount?: Address;
 };
 
 export const subaccounts = createStore(
   persist<Partial<SubAccountState>>(
     () => ({
-      universalAccount: null,
       getSigner: null,
     }),
     {
@@ -30,6 +29,7 @@ export const subaccounts = createStore(
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
         account: state.account,
+        universalAccount: state.universalAccount,
       }),
     }
   )

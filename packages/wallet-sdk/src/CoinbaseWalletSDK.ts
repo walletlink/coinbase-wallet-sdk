@@ -3,9 +3,8 @@
 import { LogoType, walletLogo } from './assets/wallet-logo.js';
 import { CoinbaseWalletProvider } from './CoinbaseWalletProvider.js';
 import { AppMetadata, Preference, ProviderInterface } from './core/provider/interface.js';
-import { VERSION } from './sdk-info.js';
-import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
 import { getFavicon } from ':core/type/util.js';
+import { storage } from ':stores/cbwsdk.js';
 import { checkCrossOriginOpenerPolicy } from ':util/checkCrossOriginOpenerPolicy.js';
 import { getCoinbaseInjectedProvider } from ':util/provider.js';
 import { validatePreferences } from ':util/validatePreferences.js';
@@ -28,7 +27,9 @@ export class CoinbaseWalletSDK {
       appLogoUrl: metadata.appLogoUrl || getFavicon(),
       appChainIds: metadata.appChainIds || [],
     };
-    this.storeLatestVersion();
+
+    storage.persist.rehydrate();
+
     void checkCrossOriginOpenerPolicy();
   }
 
@@ -46,10 +47,5 @@ export class CoinbaseWalletSDK {
    */
   public getCoinbaseWalletLogo(type: LogoType, width = 240): string {
     return walletLogo(type, width);
-  }
-
-  private storeLatestVersion() {
-    const versionStorage = new ScopedLocalStorage('CBWSDK');
-    versionStorage.setItem('VERSION', VERSION);
   }
 }

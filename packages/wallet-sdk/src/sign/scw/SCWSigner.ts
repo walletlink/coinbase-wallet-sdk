@@ -10,11 +10,10 @@ import { RPCRequestMessage, RPCResponseMessage } from ':core/message/RPCMessage.
 import { RPCResponse } from ':core/message/RPCResponse.js';
 import { AppMetadata, ProviderEventCallback, RequestArguments } from ':core/provider/interface.js';
 import { WalletConnectResponse } from ':core/rpc/wallet_connect.js';
-import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
 import { Address } from ':core/type/index.js';
 import { ensureIntNumber, hexStringFromNumber } from ':core/type/util.js';
-import { createClients, SDKChain } from ':stores/chain-clients/utils.js';
-import { subaccounts } from ':stores/sub-accounts/store.js';
+import { storage } from ':stores/cbwsdk.js';
+import { SDKChain } from ':stores/chain-clients/utils.js';
 import { assertSubAccountInfo } from ':stores/sub-accounts/utils.js';
 import { assertPresence } from ':util/assertPresence.js';
 import {
@@ -26,16 +25,6 @@ import {
 import { get } from ':util/get.js';
 import { fetchRPCRequest } from ':util/provider.js';
 
-const ACCOUNTS_KEY = 'accounts';
-const ACTIVE_CHAIN_STORAGE_KEY = 'activeChain';
-const AVAILABLE_CHAINS_STORAGE_KEY = 'availableChains';
-const WALLET_CAPABILITIES_STORAGE_KEY = 'walletCapabilities';
-
-type Chain = {
-  id: number;
-  rpcUrl?: string;
-};
-
 type ConstructorOptions = {
   metadata: AppMetadata;
   communicator: Communicator;
@@ -46,21 +35,20 @@ export class SCWSigner implements Signer {
   private readonly metadata: AppMetadata;
   private readonly communicator: Communicator;
   private readonly keyManager: SCWKeyManager;
-  private readonly storage: ScopedLocalStorage;
   private callback: ProviderEventCallback | null;
 
   private accounts: Address[];
-  private chain: Chain;
+  private chain: SDKChain;
 
   constructor(params: ConstructorOptions) {
     this.metadata = params.metadata;
     this.communicator = params.communicator;
     this.callback = params.callback;
     this.keyManager = new SCWKeyManager();
-    this.storage = new ScopedLocalStorage('CBWSDK', 'SCWStateManager');
 
-    this.accounts = this.storage.loadObject(ACCOUNTS_KEY) ?? [];
-    this.chain = this.storage.loadObject(ACTIVE_CHAIN_STORAGE_KEY) || {
+    const state = storage.getState();
+    this.accounts = state?.scw?.accounts ?? [];
+    this.chain = state?.scw?.chain ?? {
       id: params.metadata.appChainIds?.[0] ?? 1,
     };
 
@@ -68,14 +56,6 @@ export class SCWSigner implements Signer {
     this.request = this.request.bind(this);
     this.createRequestMessage = this.createRequestMessage.bind(this);
     this.decryptResponseMessage = this.decryptResponseMessage.bind(this);
-
-    // rehydrate the sub account store
-    subaccounts.persist.rehydrate(); // should this be called inside the createCoinbaseWalletSDK?
-
-    const chains = this.storage.loadObject<SDKChain[]>(AVAILABLE_CHAINS_STORAGE_KEY);
-    if (chains) {
-      createClients(chains);
-    }
   }
 
   async handshake(args: RequestArguments) {
@@ -134,7 +114,7 @@ export class SCWSigner implements Signer {
       case 'eth_chainId':
         return numberToHex(this.chain.id);
       case 'wallet_getCapabilities':
-        return this.storage.loadObject(WALLET_CAPABILITIES_STORAGE_KEY);
+        return storage.getState().scw?.capabilities;
       case 'wallet_switchEthereumChain':
         return this.handleSwitchChainRequest(request);
       case 'eth_ecRecover':
@@ -185,7 +165,13 @@ export class SCWSigner implements Signer {
       case 'eth_requestAccounts': {
         const accounts = result.value as Address[];
         this.accounts = accounts;
-        this.storage.storeObject(ACCOUNTS_KEY, accounts);
+        storage.setState((s) => ({
+          scw: {
+            ...s.scw,
+            accounts,
+            chain: this.chain,
+          },
+        }));
         this.callback?.('accountsChanged', accounts);
         break;
       }
@@ -193,7 +179,12 @@ export class SCWSigner implements Signer {
         const response = result.value as WalletConnectResponse;
         const accounts = response.accounts.map((account) => account.address);
         this.accounts = accounts;
-        this.storage.storeObject(ACCOUNTS_KEY, accounts);
+        storage.setState((s) => ({
+          scw: {
+            ...s.scw,
+            accounts,
+          },
+        }));
 
         // TODO: in future PR update state to support multiple accounts
         const account = response.accounts.at(0);
@@ -202,15 +193,17 @@ export class SCWSigner implements Signer {
           const capabilityResponse =
             capabilities?.addSubAccount ?? capabilities?.getSubAccounts?.[0];
           assertSubAccountInfo(capabilityResponse);
-          subaccounts.setState({
-            account: capabilityResponse,
-            universalAccount: this.accounts[0],
+          storage.setState({
+            subaccount: {
+              account: capabilityResponse,
+              universalAccount: this.accounts[0],
+            },
           });
         }
         const accounts_ = [this.accounts[0]];
-        const subaccount = subaccounts.getState().account;
-        if (subaccount) {
-          accounts_.push(subaccount.address);
+        const subaccount = storage.getState().subaccount;
+        if (subaccount?.account) {
+          accounts_.push(subaccount.account.address);
         }
         this.callback?.('accountsChanged', accounts_);
         break;
@@ -222,7 +215,15 @@ export class SCWSigner implements Signer {
   }
 
   async cleanup() {
-    this.storage.clear();
+    storage.setState({
+      scw: {
+        accounts: [],
+        chain: {
+          id: this.metadata.appChainIds?.[0] ?? 1,
+        },
+        keys: {},
+      },
+    });
     await this.keyManager.clear();
     this.accounts = [];
     this.chain = {
@@ -306,37 +307,49 @@ export class SCWSigner implements Signer {
           ...(nativeCurrency ? { nativeCurrency } : {}),
         };
       });
-      this.storage.storeObject(AVAILABLE_CHAINS_STORAGE_KEY, chains);
+      storage.setState({
+        chains,
+      });
       this.updateChain(this.chain.id, chains);
-      // create clients for sub accounts
-      createClients(chains);
+      // TODO: make a getOrCreateClient function and create JIT
+      // // create clients for sub accounts
+      // createClients(chains);
     }
 
     const walletCapabilities = response.data?.capabilities;
     if (walletCapabilities) {
-      this.storage.storeObject(WALLET_CAPABILITIES_STORAGE_KEY, walletCapabilities);
+      storage.setState((s) => ({
+        scw: {
+          ...s.scw,
+          capabilities: walletCapabilities,
+        },
+      }));
     }
 
     return response;
   }
 
-  private updateChain(chainId: number, newAvailableChains?: Chain[]): boolean {
-    const chains =
-      newAvailableChains ?? this.storage.loadObject<Chain[]>(AVAILABLE_CHAINS_STORAGE_KEY);
+  private updateChain(chainId: number, newAvailableChains?: SDKChain[]): boolean {
+    const chains = newAvailableChains ?? storage.getState().chains;
     const chain = chains?.find((chain) => chain.id === chainId);
     if (!chain) return false;
 
     if (chain !== this.chain) {
       this.chain = chain;
-      this.storage.storeObject(ACTIVE_CHAIN_STORAGE_KEY, chain);
+      storage.setState((s) => ({
+        scw: {
+          ...s.scw,
+          chain,
+        },
+      }));
       this.callback?.('chainChanged', hexStringFromNumber(chain.id));
     }
     return true;
   }
 
   private async addSubAccount(request: RequestArguments) {
-    const state = subaccounts.getState();
-    if (state.account) {
+    const state = storage.getState().subaccount;
+    if (state?.account) {
       this.callback?.('accountsChanged', [this.accounts[0], state.account.address]);
       return state.account;
     }
@@ -351,9 +364,11 @@ export class SCWSigner implements Signer {
     assertSubAccountInfo(response);
     // Only store the sub account information after the popup has been closed and the
     // user has confirmed the creation
-    subaccounts.setState({
-      account: response,
-      universalAccount: this.accounts[0],
+    storage.setState({
+      subaccount: {
+        account: response,
+        universalAccount: this.accounts[0],
+      },
     });
     this.callback?.('accountsChanged', [this.accounts[0], response.address]);
     return response;
@@ -361,16 +376,16 @@ export class SCWSigner implements Signer {
 
   private shouldRequestUseSubAccountSigner(request: RequestArguments) {
     const sender = getSenderFromRequest(request);
-    const state = subaccounts.getState();
+    const state = storage.getState().subaccount;
     if (sender) {
-      return sender === state.account?.address;
+      return sender === state?.account?.address;
     }
     return false;
   }
 
   private async sendRequestToSubAccountSigner(request: RequestArguments) {
-    const state = subaccounts.getState();
-    assertPresence(state.account, standardErrors.provider.unauthorized('no active sub account'));
+    const state = storage.getState().subaccount;
+    assertPresence(state?.account, standardErrors.provider.unauthorized('no active sub account'));
 
     const sender = getSenderFromRequest(request);
     // if sender is undefined, we inject the active sub account
